@@ -19,6 +19,7 @@
 set -o errexit
 set -o nounset
 set -o pipefail
+set -x
 
 TMP_ROOT="$(dirname "${BASH_SOURCE[@]}")/../.."
 KUBE_ROOT=$(readlink -e "${TMP_ROOT}" 2> /dev/null || perl -MCwd -e 'print Cwd::abs_path shift' "${TMP_ROOT}")
@@ -37,12 +38,21 @@ source "${KUBE_ROOT}/cluster/kubemark/util.sh"
 KUBECTL="${KUBE_ROOT}/cluster/kubectl.sh"
 KUBEMARK_DIRECTORY="${KUBE_ROOT}/test/kubemark"
 RESOURCE_DIRECTORY="${KUBEMARK_DIRECTORY}/resources"
+# remember to copy the cluster's kubeconnfig which kubemark joins to folder resources/
 LOCAL_KUBECONFIG="${RESOURCE_DIRECTORY}/kubeconfig.kubemark"
 INTERNAL_KUBECONFIG="${RESOURCE_DIRECTORY}/kubeconfig-internal.kubemark"
 
 # Generate a random 6-digit alphanumeric tag for the kubemark image.
 # Used to uniquify image builds across different invocations of this script.
 KUBEMARK_IMAGE_TAG=$(head /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)
+
+# remember to update the following per the test requirments and test env
+# in future we will make them as input parameters.
+KUBEMARK_IMAGE_TAG="1.21"                                                       
+KUBEMARK_IMAGE_REGISTRY="harbor-repo.vmware.com/harbor-ci/kubemark-autoip"
+# KUBECTL refers to the cluster which hollow pods deploy in.       
+KUBECTL="kubectl --kubeconfig /root/clusterctl/capv-outer.kubeconfig"           
+NAMESPACE="tmc-antrea" 
 
 # Create a docker image for hollow-node and upload it to the appropriate docker registry.
 function create-and-upload-hollow-node-image {
@@ -79,16 +89,17 @@ function delete-kubemark-image {
 # templates, and finally create these resources through kubectl.
 function create-kube-hollow-node-resources {
   # Create kubemark namespace.
-  "${KUBECTL}" create -f "${RESOURCE_DIRECTORY}/kubemark-ns.json"
+  # "${KUBECTL}" create -f "${RESOURCE_DIRECTORY}/kubemark-ns.json"
+  ${KUBECTL} create ns "${NAMESPACE}"
 
   # Create configmap for configuring hollow- kubelet, proxy and npd.
-  "${KUBECTL}" create configmap "node-configmap" --namespace="kubemark" \
+  "${KUBECTL}" create configmap "node-configmap" --namespace="${NAMESPACE}" \
     --from-file=kernel.monitor="${RESOURCE_DIRECTORY}/kernel-monitor.json"
 
   # Create secret for passing kubeconfigs to kubelet, kubeproxy and npd.
   # It's bad that all component shares the same kubeconfig.
   # TODO(https://github.com/kubernetes/kubernetes/issues/79883): Migrate all components to separate credentials.
-  "${KUBECTL}" create secret generic "kubeconfig" --type=Opaque --namespace="kubemark" \
+  "${KUBECTL}" create secret generic "kubeconfig" --type=Opaque --namespace="${NAMESPACE}" \
     --from-file=kubelet.kubeconfig="${HOLLOWNODE_KUBECONFIG}" \
     --from-file=kubeproxy.kubeconfig="${HOLLOWNODE_KUBECONFIG}" \
     --from-file=npd.kubeconfig="${HOLLOWNODE_KUBECONFIG}" \
@@ -96,43 +107,43 @@ function create-kube-hollow-node-resources {
     --from-file=cluster_autoscaler.kubeconfig="${HOLLOWNODE_KUBECONFIG}" \
     --from-file=dns.kubeconfig="${HOLLOWNODE_KUBECONFIG}"
 
-  # Create addon pods.
-  # Heapster.
-  mkdir -p "${RESOURCE_DIRECTORY}/addons"
-  sed "s@{{MASTER_IP}}@${MASTER_IP}@g" "${RESOURCE_DIRECTORY}/heapster_template.json" > "${RESOURCE_DIRECTORY}/addons/heapster.json"
-  metrics_mem_per_node=4
-  metrics_mem=$((200 + metrics_mem_per_node*NUM_NODES))
-  sed -i'' -e "s@{{METRICS_MEM}}@${metrics_mem}@g" "${RESOURCE_DIRECTORY}/addons/heapster.json"
-  metrics_cpu_per_node_numerator=${NUM_NODES}
-  metrics_cpu_per_node_denominator=2
-  metrics_cpu=$((80 + metrics_cpu_per_node_numerator / metrics_cpu_per_node_denominator))
-  sed -i'' -e "s@{{METRICS_CPU}}@${metrics_cpu}@g" "${RESOURCE_DIRECTORY}/addons/heapster.json"
-  eventer_mem_per_node=500
-  eventer_mem=$((200 * 1024 + eventer_mem_per_node*NUM_NODES))
-  sed -i'' -e "s@{{EVENTER_MEM}}@${eventer_mem}@g" "${RESOURCE_DIRECTORY}/addons/heapster.json"
+  # # Create addon pods.
+  # # Heapster.
+  # mkdir -p "${RESOURCE_DIRECTORY}/addons"
+  # sed "s@{{MASTER_IP}}@${MASTER_IP}@g" "${RESOURCE_DIRECTORY}/heapster_template.json" > "${RESOURCE_DIRECTORY}/addons/heapster.json"
+  # metrics_mem_per_node=4
+  # metrics_mem=$((200 + metrics_mem_per_node*NUM_NODES))
+  # sed -i'' -e "s@{{METRICS_MEM}}@${metrics_mem}@g" "${RESOURCE_DIRECTORY}/addons/heapster.json"
+  # metrics_cpu_per_node_numerator=${NUM_NODES}
+  # metrics_cpu_per_node_denominator=2
+  # metrics_cpu=$((80 + metrics_cpu_per_node_numerator / metrics_cpu_per_node_denominator))
+  # sed -i'' -e "s@{{METRICS_CPU}}@${metrics_cpu}@g" "${RESOURCE_DIRECTORY}/addons/heapster.json"
+  # eventer_mem_per_node=500
+  # eventer_mem=$((200 * 1024 + eventer_mem_per_node*NUM_NODES))
+  # sed -i'' -e "s@{{EVENTER_MEM}}@${eventer_mem}@g" "${RESOURCE_DIRECTORY}/addons/heapster.json"
 
-  # Cluster Autoscaler.
-  if [[ "${ENABLE_KUBEMARK_CLUSTER_AUTOSCALER:-}" == "true" ]]; then
-    echo "Setting up Cluster Autoscaler"
-    KUBEMARK_AUTOSCALER_MIG_NAME="${KUBEMARK_AUTOSCALER_MIG_NAME:-${NODE_INSTANCE_PREFIX}-group}"
-    KUBEMARK_AUTOSCALER_MIN_NODES="${KUBEMARK_AUTOSCALER_MIN_NODES:-0}"
-    KUBEMARK_AUTOSCALER_MAX_NODES="${KUBEMARK_AUTOSCALER_MAX_NODES:-10}"
-    NUM_NODES=${KUBEMARK_AUTOSCALER_MAX_NODES}
-    echo "Setting maximum cluster size to ${NUM_NODES}."
-    KUBEMARK_MIG_CONFIG="autoscaling.k8s.io/nodegroup: ${KUBEMARK_AUTOSCALER_MIG_NAME}"
-    sed "s/{{master_ip}}/${MASTER_IP}/g" "${RESOURCE_DIRECTORY}/cluster-autoscaler_template.json" > "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
-    sed -i'' -e "s@{{kubemark_autoscaler_mig_name}}@${KUBEMARK_AUTOSCALER_MIG_NAME}@g" "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
-    sed -i'' -e "s@{{kubemark_autoscaler_min_nodes}}@${KUBEMARK_AUTOSCALER_MIN_NODES}@g" "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
-    sed -i'' -e "s@{{kubemark_autoscaler_max_nodes}}@${KUBEMARK_AUTOSCALER_MAX_NODES}@g" "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
-  fi
+  # # Cluster Autoscaler.
+  # if [[ "${ENABLE_KUBEMARK_CLUSTER_AUTOSCALER:-}" == "true" ]]; then
+  #   echo "Setting up Cluster Autoscaler"
+  #   KUBEMARK_AUTOSCALER_MIG_NAME="${KUBEMARK_AUTOSCALER_MIG_NAME:-${NODE_INSTANCE_PREFIX}-group}"
+  #   KUBEMARK_AUTOSCALER_MIN_NODES="${KUBEMARK_AUTOSCALER_MIN_NODES:-0}"
+  #   KUBEMARK_AUTOSCALER_MAX_NODES="${KUBEMARK_AUTOSCALER_MAX_NODES:-10}"
+  #   NUM_NODES=${KUBEMARK_AUTOSCALER_MAX_NODES}
+  #   echo "Setting maximum cluster size to ${NUM_NODES}."
+  #   KUBEMARK_MIG_CONFIG="autoscaling.k8s.io/nodegroup: ${KUBEMARK_AUTOSCALER_MIG_NAME}"
+  #   sed "s/{{master_ip}}/${MASTER_IP}/g" "${RESOURCE_DIRECTORY}/cluster-autoscaler_template.json" > "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
+  #   sed -i'' -e "s@{{kubemark_autoscaler_mig_name}}@${KUBEMARK_AUTOSCALER_MIG_NAME}@g" "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
+  #   sed -i'' -e "s@{{kubemark_autoscaler_min_nodes}}@${KUBEMARK_AUTOSCALER_MIN_NODES}@g" "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
+  #   sed -i'' -e "s@{{kubemark_autoscaler_max_nodes}}@${KUBEMARK_AUTOSCALER_MAX_NODES}@g" "${RESOURCE_DIRECTORY}/addons/cluster-autoscaler.json"
+  # fi
 
-  # Kube DNS.
-  if [[ "${ENABLE_KUBEMARK_KUBE_DNS:-}" == "true" ]]; then
-    echo "Setting up kube-dns"
-    sed "s@{{dns_domain}}@${KUBE_DNS_DOMAIN}@g" "${RESOURCE_DIRECTORY}/kube_dns_template.yaml" > "${RESOURCE_DIRECTORY}/addons/kube_dns.yaml"
-  fi
+  # # Kube DNS.
+  # if [[ "${ENABLE_KUBEMARK_KUBE_DNS:-}" == "true" ]]; then
+  #   echo "Setting up kube-dns"
+  #   sed "s@{{dns_domain}}@${KUBE_DNS_DOMAIN}@g" "${RESOURCE_DIRECTORY}/kube_dns_template.yaml" > "${RESOURCE_DIRECTORY}/addons/kube_dns.yaml"
+  # fi
 
-  "${KUBECTL}" create -f "${RESOURCE_DIRECTORY}/addons" --namespace="kubemark"
+  # "${KUBECTL}" create -f "${RESOURCE_DIRECTORY}/addons" --namespace="${NAMESPACE}"
 
   # Create the replication controller for hollow-nodes.
   # We allow to override the NUM_REPLICAS when running Cluster Autoscaler.
@@ -164,9 +175,11 @@ function create-kube-hollow-node-resources {
   sed -i'' -e "s@{{hollow_kubelet_params}}@${hollow_kubelet_params}@g" "${RESOURCE_DIRECTORY}/hollow-node.yaml"
   sed -i'' -e "s@{{hollow_proxy_params}}@${hollow_proxy_params}@g" "${RESOURCE_DIRECTORY}/hollow-node.yaml"
   sed -i'' -e "s@{{kubemark_mig_config}}@${KUBEMARK_MIG_CONFIG:-}@g" "${RESOURCE_DIRECTORY}/hollow-node.yaml"
-  "${KUBECTL}" create -f "${RESOURCE_DIRECTORY}/hollow-node.yaml" --namespace="kubemark"
+  "${KUBECTL}" create -f "${RESOURCE_DIRECTORY}/hollow-node.yaml" --namespace="${NAMESPACE}"
 
   echo "Created secrets, configMaps, replication-controllers required for hollow-nodes."
+  echo "Please manually check whether the hollow nodes are joining as expected"
+  exit 1
 }
 
 # Wait until all hollow-nodes are running or there is a timeout.
@@ -212,9 +225,9 @@ function wait-for-hollow-nodes-to-run-or-timeout {
 function start-hollow-nodes {
   # shellcheck disable=SC2154 # Color defined in sourced script
   echo -e "${color_yellow}STARTING SETUP FOR HOLLOW-NODES${color_norm}"
-  create-and-upload-hollow-node-image
+  #-and-upload-hollow-node-image
   create-kube-hollow-node-resources
-  wait-for-hollow-nodes-to-run-or-timeout
+  #wait-for-hollow-nodes-to-run-or-timeout
 }
 
 # Annotates the node objects in the kubemark cluster to make their size
